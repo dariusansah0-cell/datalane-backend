@@ -9,9 +9,13 @@ const Agent = require("./models/Agent");
 const Order = require("./models/Order");
 const { verifyPaystackTransaction } = require("./paystack");
 const { sendSms } = require("./sms");
+const { purchaseBundle, verifyWebhookSignature } = require("./bignash");
 
 const app = express();
-app.use(express.json());
+
+// Capture the raw request body (needed to verify BigNash's webhook signature)
+// while still parsing JSON normally for every other route.
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -45,12 +49,21 @@ function requireAgent(req, res, next) {
   }
 }
 
+/* ------------------------------ helpers ---------------------------------- */
+// Shared by both the admin's manual "Mark Delivered" click and the BigNash
+// webhook — sends the "your data has landed" SMS exactly once, however the
+// order got there.
+async function notifyDelivered(order) {
+  await sendSms(order.phone, `Your ${order.network} ${order.bundle} has been delivered. Thank you for choosing DataLane GH.`);
+}
+
 /* ---------------------------------------------------------------------------
    ORDERS
 --------------------------------------------------------------------------- */
 
 // Called right after the Paystack popup succeeds on the frontend.
-// Verifies the payment server-side before trusting it, THEN creates the orders.
+// Verifies the payment server-side before trusting it, creates the orders,
+// THEN dispatches each one to BigNash so the real bundle actually gets sent.
 app.post("/api/orders/verify", async (req, res) => {
   const { reference, items } = req.body;
   if (!reference || !Array.isArray(items) || items.length === 0) {
@@ -76,6 +89,25 @@ app.post("/api/orders/verify", async (req, res) => {
       amount: item.amount,
       status: "Processing"
     });
+
+    // Dispatch the real bundle. If BigNash itself fails or isn't configured,
+    // we do NOT fail the customer's order (they've already paid) — we log it
+    // and leave the order in "Processing" for the admin to see and retry/refund.
+    const dispatch = await purchaseBundle({
+      recipientPhone: item.phone,
+      network: item.network,
+      bundleLabel: item.bundle,
+      reference: order.ref
+    });
+    if (dispatch.ok) {
+      order.bignashStatus = "pending";
+      order.bignashCarrier = dispatch.carrier;
+      order.bignashOrderId = dispatch.raw?.data?.id ? String(dispatch.raw.data.id) : null;
+    } else {
+      order.deliveryFailureReason = dispatch.error;
+      console.error(`BigNash dispatch failed for order ${order.ref}:`, dispatch.error);
+    }
+    await order.save();
     created.push(order);
   }
   res.json({ orders: created });
@@ -97,7 +129,9 @@ app.get("/api/admin/orders", requireAdmin, async (req, res) => {
   res.json({ orders });
 });
 
-// Admin: move an order to the next status. Sends a real SMS when it hits Delivered.
+// Admin: move an order to the next status manually. Sends a real SMS when it
+// hits Delivered. Once BigNash's webhook is live, most orders will reach
+// Delivered on their own — this stays as a manual fallback/override.
 app.post("/api/admin/orders/:ref/advance", requireAdmin, async (req, res) => {
   const stages = ["Pending", "Processing", "Delivered", "Completed"];
   const order = await Order.findOne({ ref: req.params.ref });
@@ -106,17 +140,45 @@ app.post("/api/admin/orders/:ref/advance", requireAdmin, async (req, res) => {
   if (nextIdx >= stages.length) return res.status(400).json({ error: "Already at final status" });
   order.status = stages[nextIdx];
   await order.save();
-  if (order.status === "Delivered") {
-    await sendSms(order.phone, `Your ${order.network} ${order.bundle} has been delivered. Thank you for choosing DataLane GH.`);
-  }
+  if (order.status === "Delivered") await notifyDelivered(order);
   res.json({ order });
+});
+
+/* ---------------------------------------------------------------------------
+   BIGNASH WEBHOOK — real-time delivery confirmation
+--------------------------------------------------------------------------- */
+app.post("/api/webhooks/bignash", async (req, res) => {
+  const signature = req.headers["x-webhook-signature"];
+  const valid = verifyWebhookSignature(req.rawBody, signature);
+  if (!valid) return res.status(401).send("invalid signature");
+
+  const event = req.body;
+  const data = event?.data || {};
+  // BigNash echoes back the "reference" we sent them, which is our own order.ref.
+  const order = await Order.findOne({ ref: data.reference });
+  if (!order) return res.status(200).send("ok"); // unknown order — nothing to do, still ack
+
+  if (event.event === "purchase.success") {
+    order.bignashStatus = "completed";
+    order.status = "Delivered";
+    await order.save();
+    await notifyDelivered(order);
+  } else if (event.event === "purchase.failed") {
+    order.bignashStatus = "failed";
+    order.deliveryFailureReason = data.failure_reason || "Delivery failed at BigNash";
+    await order.save();
+    console.error(`BigNash delivery failed for order ${order.ref}:`, order.deliveryFailureReason);
+    // Order.status is intentionally left as-is (usually "Processing") so it
+    // stays visible to the admin as needing attention (refund or retry).
+  }
+
+  res.status(200).send("ok");
 });
 
 /* ---------------------------------------------------------------------------
    AGENTS
 --------------------------------------------------------------------------- */
 
-// Called after the Paystack popup succeeds for the GHC50 agent fee.
 app.post("/api/agents/register", async (req, res) => {
   const { name, storeName, phone, email, password, reference } = req.body;
   if (!name || !phone || !email || !password || !reference) {
